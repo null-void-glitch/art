@@ -1,0 +1,249 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SDF Landscape — starter</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  canvas { display: block; width: 100vw; height: 100vh; }
+  #err {
+    position: fixed; left: 0; top: 0; right: 0;
+    font: 13px/1.4 monospace; color: #f66; background: #200;
+    padding: 8px 12px; white-space: pre-wrap; display: none;
+  }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<pre id="err"></pre>
+
+<!-- =====================================================================
+     THE SHADER
+     This is the only part you need to touch. Everything below it is plumbing
+     (it just paints this shader onto the whole screen, once per frame).
+
+     A "fragment shader" is a tiny program that runs ONCE PER PIXEL, in
+     parallel, on your GPU. Its whole job: decide the colour of that pixel.
+     We get the pixel's position and the current time; we output a colour.
+
+     The technique: RAYMARCHING a SIGNED DISTANCE FIELD (SDF).
+       - An SDF is a function map(p) that, for any point p in 3D space,
+         returns the distance to the nearest surface.
+       - To draw, we shoot a ray from the camera through each pixel and
+         "march" along it: ask the SDF how far the nearest surface is, step
+         that far (safe — we can't have hit anything closer), repeat until
+         we're basically touching a surface or we give up.
+       - Then we light that hit point: sun, sky, shadow, fog.
+====================================================================== -->
+<script id="frag" type="x-shader/x-fragment">
+precision highp float;
+
+uniform vec2  uResolution;   // canvas size in pixels
+uniform float uTime;         // seconds since load
+
+// ---------------------------------------------------------------------
+// 1. NOISE  — the raw material of all procedural terrain.
+// A hash turns a 2D coord into a pseudo-random number. Value noise then
+// smoothly interpolates those randoms. fbm() stacks several scaled copies
+// ("octaves") to get natural-looking detail: big hills + small bumps.
+// ---------------------------------------------------------------------
+float hash(vec2 p) {
+    p = fract(p * vec2(123.34, 345.45));
+    p += dot(p, p + 34.345);
+    return fract(p.x * p.y);
+}
+
+float noise(vec2 p) {
+    vec2 i = floor(p);
+    vec2 f = fract(p);
+    f = f * f * (3.0 - 2.0 * f);            // smoothstep curve = no hard edges
+    float a = hash(i + vec2(0.0, 0.0));
+    float b = hash(i + vec2(1.0, 0.0));
+    float c = hash(i + vec2(0.0, 1.0));
+    float d = hash(i + vec2(1.0, 1.0));
+    return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
+}
+
+float fbm(vec2 p) {
+    float sum = 0.0;
+    float amp = 0.5;        // how much this octave contributes
+    for (int i = 0; i < 6; i++) {
+        sum += amp * noise(p);
+        p   *= 2.0;         // each octave: twice the frequency...
+        amp *= 0.5;         // ...half the height
+    }
+    return sum;
+}
+
+// ---------------------------------------------------------------------
+// 2. THE SCENE as a distance field.
+// terrain() is the ground height at a given (x,z). The SDF is then simply
+// "how far is point p above/below the ground". Multiplying our marching
+// steps by < 1 later keeps this honest (heightfields can over-estimate).
+// ---------------------------------------------------------------------
+float terrain(vec2 xz) {
+    return fbm(xz * 0.15) * 8.0;   // 0.15 = feature size, 4.0 = mountain height
+}
+
+float map(vec3 p) {
+    return p.y - terrain(p.xz);    // >0 above ground, <0 below, 0 on surface
+}
+
+// ---------------------------------------------------------------------
+// 3. SURFACE NORMAL — which way the ground faces, needed for lighting.
+// We sample the SDF at 4 nearby points and take the gradient.
+// ---------------------------------------------------------------------
+vec3 calcNormal(vec3 p) {
+    vec2 e = vec2(0.01, 0.0);
+    return normalize(vec3(
+        map(p + e.xyy) - map(p - e.xyy),
+        map(p + e.yxy) - map(p - e.yxy),
+        map(p + e.yyx) - map(p - e.yyx)
+    ));
+}
+
+// ---------------------------------------------------------------------
+// 4. RAYMARCH — walk the ray forward until we hit ground.
+// Returns the distance travelled, or -1.0 if we hit nothing.
+// ---------------------------------------------------------------------
+float raymarch(vec3 ro, vec3 rd) {
+    float t = 0.1;
+    for (int i = 0; i < 200; i++) {
+        vec3 p = ro + rd * t;
+        float d = map(p);
+        if (d < 0.01 * t) return t;     // close enough -> hit
+        t += d * 0.4;                   // 0.4 = take cautious steps
+        if (t > 120.0) break;           // too far -> give up (sky)
+    }
+    return -1.0;
+}
+
+// Cheap soft shadow: march toward the sun; if the ground gets in the way,
+// darken. The min() trick gives soft penumbra edges instead of hard ones.
+float softShadow(vec3 p, vec3 lightDir) {
+    float res = 1.0;
+    float t = 0.1;
+    for (int i = 0; i < 40; i++) {
+        float d = map(p + lightDir * t);
+        if (d < 0.01) return 0.0;
+        res = min(res, 12.0 * d / t);
+        t += d * 0.5;
+        if (t > 40.0) break;
+    }
+    return clamp(res, 0.0, 1.0);
+}
+
+void main() {
+    // Pixel -> screen coordinate in range roughly [-1,1], aspect-corrected.
+    vec2 uv = (gl_FragCoord.xy - 0.5 * uResolution.xy) / uResolution.y;
+
+    // --- CAMERA --- slowly drift forward, look slightly down.
+    vec3 ro = vec3(0.0, 6.0, -uTime * 2.0);          // ray origin (eye)
+    vec3 ta = ro + vec3(0.0, -0.25, 1.0);            // target it looks at
+    vec3 fwd = normalize(ta - ro);
+    vec3 right = normalize(cross(vec3(0,1,0), fwd));
+    vec3 up = cross(fwd, right);
+    vec3 rd = normalize(uv.x * right + uv.y * up + 1.2 * fwd);  // 1.2 = zoom
+
+    // --- SUN / SKY ---
+    vec3 sunDir = normalize(vec3(0.8, 0.35, 0.4));
+    vec3 skyTop = vec3(0.35, 0.55, 0.85);
+    vec3 skyBot = vec3(0.75, 0.80, 0.85);
+    vec3 sky = mix(skyBot, skyTop, clamp(rd.y * 1.5 + 0.2, 0.0, 1.0));
+    sky += vec3(1.0, 0.8, 0.5) * pow(max(dot(rd, sunDir), 0.0), 64.0); // sun glow
+
+    vec3 col = sky;
+
+    // --- TRACE THE GROUND ---
+    float t = raymarch(ro, rd);
+    if (t > 0.0) {
+        vec3 p = ro + rd * t;
+        vec3 n = calcNormal(p);
+
+        float diff = max(dot(n, sunDir), 0.0);          // direct sunlight
+        diff *= softShadow(p + n * 0.02, sunDir);       // cast shadows
+        float sky_l = 0.5 + 0.5 * n.y;                  // soft fill from sky above
+
+        // Colour the ground by height & steepness: grass low, rock on slopes,
+        // snow up high. Just mixing colours — tweak these freely.
+        float h = terrain(p.xz);
+        vec3 grass = vec3(0.25, 0.35, 0.15);
+        vec3 rock  = vec3(0.30, 0.27, 0.24);
+        vec3 snow  = vec3(0.92, 0.93, 0.96);
+        vec3 mat = mix(grass, rock, smoothstep(2.0, 4.0, h));
+        mat = mix(mat, snow, smoothstep(5.0, 7.0, h) * smoothstep(0.5, 0.8, n.y));
+
+        col  = mat * (vec3(1.05, 0.9, 0.7) * diff      // warm sun
+                    + vec3(0.30, 0.40, 0.55) * sky_l); // cool sky fill
+
+        // --- FOG --- fade distant ground into the sky. This one line is what
+        // makes it read as a vast landscape instead of a tabletop model.
+        col = mix(col, sky, 1.0 - exp(-0.00015 * t * t));
+    }
+
+    // Tone map (squash bright values) + gamma (perceptual brightness).
+    col = col / (col + 1.0);
+    col = pow(col, vec3(0.4545));
+
+    gl_FragColor = vec4(col, 1.0);
+}
+</script>
+
+<!-- ===================== PLUMBING (ignore for now) ===================== -->
+<script>
+const canvas = document.getElementById('c');
+const gl = canvas.getContext('webgl');
+const errBox = document.getElementById('err');
+function fail(msg){ errBox.style.display='block'; errBox.textContent = msg; }
+
+if (!gl) { fail('WebGL not available in this browser.'); }
+
+const vsSrc = `attribute vec2 a; void main(){ gl_Position = vec4(a,0.0,1.0); }`;
+const fsSrc = document.getElementById('frag').textContent;
+
+function compile(type, src){
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src); gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS))
+    fail('Shader error:\n' + gl.getShaderInfoLog(s));
+  return s;
+}
+
+const prog = gl.createProgram();
+gl.attachShader(prog, compile(gl.VERTEX_SHADER, vsSrc));
+gl.attachShader(prog, compile(gl.FRAGMENT_SHADER, fsSrc));
+gl.linkProgram(prog);
+gl.useProgram(prog);
+
+// Two triangles covering the whole screen — the shader runs on every pixel.
+const buf = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 3,-1, -1,3]), gl.STATIC_DRAW);
+const loc = gl.getAttribLocation(prog, 'a');
+gl.enableVertexAttribArray(loc);
+gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
+
+const uRes  = gl.getUniformLocation(prog, 'uResolution');
+const uTime = gl.getUniformLocation(prog, 'uTime');
+
+function resize(){
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  canvas.width  = canvas.clientWidth  * dpr;
+  canvas.height = canvas.clientHeight * dpr;
+  gl.viewport(0, 0, canvas.width, canvas.height);
+}
+window.addEventListener('resize', resize);
+resize();
+
+const start = performance.now();
+function frame(){
+  gl.uniform2f(uRes, canvas.width, canvas.height);
+  gl.uniform1f(uTime, (performance.now() - start) / 1000);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+  requestAnimationFrame(frame);
+}
+frame();
+</script>
+</body>
+</html>
